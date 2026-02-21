@@ -1,0 +1,13 @@
+streamlit>=1.28.0
+pandas>=2.0.0
+plotly>=5.18.0
+openpyxl>=3.1.0
+numpy>=1.24.0
+
+# Für Deployment auf Streamlit Cloud / Railway / Render
+# Diese Dependencies sind bereits enthalten, aber hier für Vollständigkeit:
+# - streamlit: Web-Framework
+# - pandas: Datenverarbeitung
+# - plotly: Visualisierungen
+# - openpyxl: Excel-Dateien lesen
+# - numpy: Numerische Operationen
