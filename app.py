@@ -59,7 +59,7 @@ st.markdown("""
 # ---------------------------------------------------------------------------
 @st.cache_data
 def load_excel(file) -> dict[str, pd.DataFrame]:
-    """Read Claims, Premiums and Reserves sheets from an Excel file."""
+    """Read Claims, Premiums, Reserves and Facilities sheets from an Excel file."""
     xls = pd.ExcelFile(file, engine="openpyxl")
     data = {}
 
@@ -70,6 +70,9 @@ def load_excel(file) -> dict[str, pd.DataFrame]:
         df["Quarter"] = df["Claim_Date"].dt.quarter
         df["YearQuarter"] = df["Year"].astype(str) + "-Q" + df["Quarter"].astype(str)
         df["Month"] = df["Claim_Date"].dt.to_period("M").astype(str)
+        # Facility column may not exist in older uploaded files
+        if "Facility" not in df.columns:
+            df["Facility"] = ""
         data["claims"] = df
 
     if "Premiums" in xls.sheet_names:
@@ -77,6 +80,9 @@ def load_excel(file) -> dict[str, pd.DataFrame]:
 
     if "Reserves" in xls.sheet_names:
         data["reserves"] = pd.read_excel(xls, "Reserves")
+
+    if "Facilities" in xls.sheet_names:
+        data["facilities"] = pd.read_excel(xls, "Facilities")
 
     return data
 
@@ -99,7 +105,7 @@ use_demo = st.sidebar.checkbox("Use demo data", value=True)
 
 uploaded_file = st.sidebar.file_uploader(
     "Upload Excel file", type=["xlsx", "xls"],
-    help="Upload a file with sheets: Claims, Premiums, Reserves",
+    help="Upload a file with sheets: Claims, Premiums, Reserves, Facilities",
 )
 
 if uploaded_file is not None:
@@ -116,6 +122,7 @@ else:
 claims = data.get("claims", pd.DataFrame())
 premiums = data.get("premiums", pd.DataFrame())
 reserves = data.get("reserves", pd.DataFrame())
+facilities = data.get("facilities", pd.DataFrame())
 
 # ---------------------------------------------------------------------------
 # Sidebar: filters
@@ -154,9 +161,16 @@ if not claims.empty:
         fp = premiums[premiums["Country"].isin(selected_countries)].copy()
     else:
         fp = premiums
+
+    # Filter facilities
+    if not facilities.empty:
+        ff = facilities[facilities["Country"].isin(selected_countries)].copy()
+    else:
+        ff = facilities
 else:
     fc = claims
     fp = premiums
+    ff = facilities
 
 # ---------------------------------------------------------------------------
 # Title
@@ -166,9 +180,9 @@ st.title("Medical Expat Scheme – Risk Dashboard")
 # ---------------------------------------------------------------------------
 # Navigation
 # ---------------------------------------------------------------------------
-tab_overview, tab_trends, tab_risk, tab_country, tab_warnings = st.tabs([
+tab_overview, tab_trends, tab_risk, tab_country, tab_facilities, tab_warnings = st.tabs([
     "Overview", "Claims Trend", "Risk Distribution",
-    "Country Analysis", "Early Warnings",
+    "Country Analysis", "Inpatient Facilities", "Early Warnings",
 ])
 
 # ===================== TAB 1: OVERVIEW =====================
@@ -412,7 +426,6 @@ with tab_risk:
                     fc.groupby("Benefit_Type")["Claim_Amount_USD"].sum().reset_index()
                 )
                 total_prem = fp["Earned_Premium_USD"].sum()
-                # Approximate allocation by claim share
                 benefit_incurred["Share"] = (
                     benefit_incurred["Claim_Amount_USD"]
                     / benefit_incurred["Claim_Amount_USD"].sum()
@@ -492,7 +505,6 @@ with tab_country:
             .sort_values("Total_Incurred", ascending=False)
         )
 
-        # Country premium data
         if not fp.empty:
             country_prem = (
                 fp.groupby("Country")
@@ -511,7 +523,6 @@ with tab_country:
                 country_agg["Claim_Count"] / country_agg["Avg_Lives"]
             ).round(2)
 
-        # Map (choropleth)
         country_iso = {
             "United Arab Emirates": "ARE", "Singapore": "SGP",
             "Hong Kong": "HKG", "United Kingdom": "GBR",
@@ -534,7 +545,6 @@ with tab_country:
         fig.update_layout(height=500, geo=dict(showframe=False))
         st.plotly_chart(fig, use_container_width=True)
 
-        # Country table
         st.subheader("Country Details")
         display_cols = [
             "Country", "Claim_Count", "Total_Incurred", "Avg_Claim", "Max_Claim",
@@ -554,7 +564,6 @@ with tab_country:
             height=500,
         )
 
-        # Country comparison
         if "Loss_Ratio" in country_agg.columns:
             st.subheader("Country Risk Matrix")
             fig = px.scatter(
@@ -572,14 +581,229 @@ with tab_country:
             st.plotly_chart(fig, use_container_width=True)
 
 
-# ===================== TAB 5: EARLY WARNINGS =====================
+# ===================== TAB 5: INPATIENT FACILITIES =====================
+with tab_facilities:
+    st.subheader("Inpatient Facilities by Country")
+
+    # Build facility data: prefer the dedicated Facilities sheet;
+    # fall back to deriving from Claims if the sheet is absent.
+    if not ff.empty:
+        fac_data = ff.copy()
+    elif not fc.empty:
+        # Derive from claims filtered to Inpatient with a non-empty Facility
+        inpatient = fc[
+            (fc["Benefit_Type"] == "Inpatient") & (fc["Facility"].str.strip() != "")
+        ].copy()
+        if inpatient.empty:
+            st.info(
+                "No Facilities sheet found and no facility names in Claims data. "
+                "Please upload an Excel file that includes a Facilities sheet or "
+                "a Claims sheet with a 'Facility' column."
+            )
+            st.stop()
+        fac_data = (
+            inpatient.groupby(["Country", "Facility"])
+            .agg(
+                Claim_Count=("Claim_ID", "count"),
+                Total_Incurred_USD=("Claim_Amount_USD", "sum"),
+                Avg_Claim_USD=("Claim_Amount_USD", "mean"),
+                Max_Claim_USD=("Claim_Amount_USD", "max"),
+            )
+            .reset_index()
+            .rename(columns={"Facility": "Facility_Name"})
+        )
+        fac_data["Large_Claims_Count"] = inpatient[
+            inpatient["Claim_Amount_USD"] > 50_000
+        ].groupby(["Country", "Facility"])["Claim_ID"].count().reindex(
+            pd.MultiIndex.from_frame(fac_data[["Country", "Facility_Name"]]),
+            fill_value=0,
+        ).values
+        fac_data["Large_Claims_Pct"] = (
+            fac_data["Large_Claims_Count"] / fac_data["Claim_Count"] * 100
+        ).round(1)
+        fac_data["Total_Incurred_USD"] = fac_data["Total_Incurred_USD"].round(2)
+        fac_data["Avg_Claim_USD"] = fac_data["Avg_Claim_USD"].round(2)
+    else:
+        st.warning("No data available.")
+        st.stop()
+
+    # ---- KPI summary row ----
+    total_facilities = len(fac_data)
+    total_inpatient_incurred = fac_data["Total_Incurred_USD"].sum()
+    avg_claim_all = fac_data["Avg_Claim_USD"].mean()
+    top_facility_row = fac_data.loc[fac_data["Total_Incurred_USD"].idxmax()]
+    countries_with_facilities = fac_data["Country"].nunique()
+
+    kpi_cols = st.columns(4)
+    with kpi_cols[0]:
+        st.markdown(
+            metric_card("Total Facilities", f"{total_facilities}"),
+            unsafe_allow_html=True,
+        )
+    with kpi_cols[1]:
+        st.markdown(
+            metric_card("Countries", f"{countries_with_facilities}"),
+            unsafe_allow_html=True,
+        )
+    with kpi_cols[2]:
+        st.markdown(
+            metric_card("Total Inpatient Incurred", f"${total_inpatient_incurred:,.0f}"),
+            unsafe_allow_html=True,
+        )
+    with kpi_cols[3]:
+        st.markdown(
+            metric_card(
+                "Top Facility by Cost",
+                top_facility_row["Facility_Name"].split("–")[0].strip()[:20],
+            ),
+            unsafe_allow_html=True,
+        )
+
+    st.markdown("---")
+
+    # ---- Top-N facilities bar chart ----
+    col_chart, col_filter = st.columns([3, 1])
+    with col_filter:
+        top_n = st.slider("Show Top N Facilities", min_value=5, max_value=30, value=15)
+
+    top_fac = (
+        fac_data.nlargest(top_n, "Total_Incurred_USD").copy()
+    )
+    top_fac["Label"] = top_fac["Facility_Name"].str[:30] + " (" + top_fac["Country"] + ")"
+
+    with col_chart:
+        st.subheader(f"Top {top_n} Facilities by Total Incurred")
+
+    fig = px.bar(
+        top_fac.sort_values("Total_Incurred_USD"),
+        x="Total_Incurred_USD",
+        y="Label",
+        orientation="h",
+        color="Country",
+        text=top_fac.sort_values("Total_Incurred_USD")["Claim_Count"].astype(str) + " claims",
+        labels={"Total_Incurred_USD": "Total Incurred (USD)", "Label": ""},
+        color_discrete_sequence=px.colors.qualitative.Pastel,
+    )
+    fig.update_layout(height=max(400, top_n * 30), showlegend=True,
+                      legend=dict(orientation="h", y=1.05))
+    fig.update_traces(textposition="inside")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # ---- Country drilldown ----
+    st.subheader("Country Drilldown")
+    available_countries = sorted(fac_data["Country"].unique())
+    selected_fac_country = st.selectbox(
+        "Select a country to see its facilities:",
+        options=available_countries,
+        index=available_countries.index("China") if "China" in available_countries else 0,
+    )
+
+    country_fac = fac_data[fac_data["Country"] == selected_fac_country].copy()
+    country_fac = country_fac.sort_values("Total_Incurred_USD", ascending=False)
+
+    # Mini KPIs for selected country
+    mini_cols = st.columns(4)
+    with mini_cols[0]:
+        st.metric("Facilities", len(country_fac))
+    with mini_cols[1]:
+        st.metric("Total Incurred", f"${country_fac['Total_Incurred_USD'].sum():,.0f}")
+    with mini_cols[2]:
+        st.metric("Total Claims", f"{country_fac['Claim_Count'].sum():,}")
+    with mini_cols[3]:
+        st.metric(
+            "Avg Claim",
+            f"${country_fac['Avg_Claim_USD'].mean():,.0f}",
+        )
+
+    # Pie chart + bar chart side by side
+    drill_col1, drill_col2 = st.columns(2)
+
+    with drill_col1:
+        fig = px.pie(
+            country_fac,
+            values="Total_Incurred_USD",
+            names="Facility_Name",
+            title=f"Share of Incurred – {selected_fac_country}",
+            hole=0.4,
+            color_discrete_sequence=px.colors.qualitative.Set2,
+        )
+        fig.update_traces(textposition="inside", textinfo="percent+label")
+        fig.update_layout(height=420, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+    with drill_col2:
+        fig = px.bar(
+            country_fac,
+            x="Facility_Name",
+            y=["Total_Incurred_USD", "Avg_Claim_USD"],
+            barmode="group",
+            title=f"Incurred vs. Avg Claim – {selected_fac_country}",
+            labels={
+                "value": "USD",
+                "Facility_Name": "",
+                "variable": "",
+            },
+            color_discrete_map={
+                "Total_Incurred_USD": "#667eea",
+                "Avg_Claim_USD": "#f5576c",
+            },
+        )
+        fig.update_layout(height=420, xaxis_tickangle=-30)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Detail table for selected country
+    st.subheader(f"Facility Details – {selected_fac_country}")
+    display_fac_cols = [
+        "Facility_Name", "Claim_Count", "Total_Incurred_USD",
+        "Avg_Claim_USD", "Max_Claim_USD", "Large_Claims_Count", "Large_Claims_Pct",
+    ]
+    # Add City column if present
+    if "City" in country_fac.columns:
+        display_fac_cols = ["City"] + display_fac_cols
+
+    format_dict = {
+        "Total_Incurred_USD": "${:,.0f}",
+        "Avg_Claim_USD": "${:,.0f}",
+        "Max_Claim_USD": "${:,.0f}",
+        "Large_Claims_Pct": "{:.1f}%",
+    }
+
+    st.dataframe(
+        country_fac[display_fac_cols].style.format(format_dict),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.markdown("---")
+
+    # ---- Full facility table (all countries) ----
+    with st.expander("Full Facility Table – All Countries", expanded=False):
+        all_display_cols = [
+            "Country", "Facility_Name", "Claim_Count", "Total_Incurred_USD",
+            "Avg_Claim_USD", "Max_Claim_USD", "Large_Claims_Count", "Large_Claims_Pct",
+        ]
+        if "City" in fac_data.columns:
+            all_display_cols = ["Country", "City"] + all_display_cols[1:]
+
+        st.dataframe(
+            fac_data.sort_values("Total_Incurred_USD", ascending=False)[
+                all_display_cols
+            ].style.format(format_dict),
+            use_container_width=True,
+            hide_index=True,
+            height=600,
+        )
+
+
+# ===================== TAB 6: EARLY WARNINGS =====================
 with tab_warnings:
     st.subheader("Early Warning Indicators")
 
     if fc.empty:
         st.warning("No claims data available.")
     else:
-        # Configurable thresholds
         with st.expander("Configure Thresholds", expanded=False):
             col1, col2, col3 = st.columns(3)
             with col1:
@@ -598,7 +822,6 @@ with tab_warnings:
 
         warnings = []
 
-        # 1) Overall Loss Ratio
         if not fp.empty:
             total_incurred = fc["Claim_Amount_USD"].sum()
             total_prem = fp["Earned_Premium_USD"].sum()
@@ -612,7 +835,6 @@ with tab_warnings:
                     "Detail": "Overall loss ratio exceeds target.",
                 })
 
-        # 2) Country-level loss ratios
         if not fp.empty:
             c_inc = fc.groupby("Country")["Claim_Amount_USD"].sum()
             c_prem = fp.groupby("Country")["Earned_Premium_USD"].sum()
@@ -627,7 +849,6 @@ with tab_warnings:
                         "Detail": f"{country} exceeds target loss ratio.",
                     })
 
-        # 3) Large claims concentration
         large = fc[fc["Claim_Amount_USD"] > large_claim_threshold]
         if len(large) > 0:
             large_pct = large["Claim_Amount_USD"].sum() / fc["Claim_Amount_USD"].sum() * 100
@@ -643,7 +864,6 @@ with tab_warnings:
                     ),
                 })
 
-        # 4) Recent trend (last quarter vs. previous)
         if len(fc["YearQuarter"].unique()) >= 2:
             quarters = sorted(fc["YearQuarter"].unique())
             last_q = fc[fc["YearQuarter"] == quarters[-1]]["Claim_Amount_USD"].sum()
@@ -662,7 +882,6 @@ with tab_warnings:
                         ),
                     })
 
-        # 5) IBNR growth
         if not reserves.empty and len(reserves) >= 2:
             last_ibnr = reserves.iloc[-1]["IBNR_USD"]
             prev_ibnr = reserves.iloc[-2]["IBNR_USD"]
@@ -677,11 +896,9 @@ with tab_warnings:
                         "Detail": "IBNR reserves growing faster than expected.",
                     })
 
-        # Display warnings
         if not warnings:
             st.success("No warnings – all indicators within acceptable ranges.")
         else:
-            # Summary
             critical = sum(1 for w in warnings if w["Status"] == "CRITICAL")
             warning_count = sum(1 for w in warnings if w["Status"] == "WARNING")
 
@@ -704,7 +921,6 @@ with tab_warnings:
 
             st.markdown("---")
 
-            # Warning table
             warn_df = pd.DataFrame(warnings)
             warn_df = warn_df.sort_values(
                 "Status", key=lambda x: x.map({"CRITICAL": 0, "WARNING": 1}),
@@ -718,7 +934,6 @@ with tab_warnings:
                     st.write(f"**Threshold:** {row['Threshold']}")
                     st.write(f"**Detail:** {row['Detail']}")
 
-        # Trend sparklines for key indicators
         if not fp.empty:
             st.markdown("---")
             st.subheader("Quarterly Indicator Trends")
@@ -771,4 +986,5 @@ if st.sidebar.button("Download Excel Template"):
     )
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Medical Expat Scheme – Risk Dashboard v1.0")
+st.sidebar.caption("Medical Expat Scheme – Risk Dashboard v1.1")
+
